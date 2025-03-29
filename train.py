@@ -4,6 +4,7 @@ from encoding import *
 import visualization as v
 
 
+# Обучение
 def train_epochs(
     snn,                                        # объект SNNnetwork
     mnist_dataset,                              # загруженный датасет mnist
@@ -11,7 +12,7 @@ def train_epochs(
     images_per_direction=200,                   # количество обрабатываемых картинок для каждого направления
     steps_per_image=10,                         # на сколько пикселей сдвигать картинку
     dt=5.0,                                     # время, за которое выполняется сдвиг на 1 пиксель (мс)
-    threshold=0.67,                             # порог яркости для генерации события
+    threshold=0.67,                             # порог изменения яркости для генерации события
     pixel_ref=3.0,                              # рефрактерный период для генерации событий (мс)
     substeps=2,                                 # на сколько шагов делится сдвиг на один пиксель
     epochs=3,                                   # количество эпох (сколько раз прогоняем на одной выборке)
@@ -73,6 +74,9 @@ def train_epochs(
         correct_predictions = 0     # кол-во верных предсказаний
         total_predictions = 0       # общее кол-во предсказаний
 
+        # Для построения растра спайков за эпоху
+        all_spikes_image = []
+        
         # Обрабатываем все пары
         for direction_label, events in all_events:
             # Сбрасываем состояние сети (кроме весов) перед новым изображением
@@ -84,8 +88,9 @@ def train_epochs(
 
             # Подсчитываем количество спайков каждого нейрона
             spike_counts = [0] * snn.count_neurons
-            for _, neuron_id in snn.spikes:
+            for spike_time, neuron_id in snn.spikes:
                 spike_counts[neuron_id] += 1
+                all_spikes_image.append((spike_time, neuron_id))
 
             # Обновляем статистику спайков нейронов для текущего направления
             for neuron_id, count in enumerate(spike_counts):
@@ -138,12 +143,97 @@ def train_epochs(
         # Строим гистограммы весов для первых нейронов (для отладки)
         for neuron_id in range(5):
             v.plot_neuron_weight_histogram(snn.weights, neuron_id)
+        # Отслеживаем статистику усилений и ослаблений за все время
+        v.plot_ltp_ltd_counts(snn.ltp_counts_history, snn.ltd_counts_history)
+        # Строим растр спайков за эпоху
+        v.spike_raster(all_spikes_image)
 
 
     # Возвращаем результаты за последнюю эпоху
     final_neuron_stats = neuron_stats_epoch
     final_neuron_preference = neuron_preference_epoch
 
+    return final_neuron_stats, final_neuron_preference, epoch_accuracy
 
-    return final_neuron_stats, final_neuron_preference
 
+
+# Предсказание
+def test_prediction(
+    snn,                                        # объект SNNnetwork
+    mnist_dataset,                              # загруженный датасет mnist
+    neuron_preference,                          # сформированный при обучении словарь предпочтений
+    directions=("right", "down", "left", "up"), # направления для сдвига
+    images_per_direction=100,                   # количество обрабатываемых картинок для каждого направления
+    steps_per_image=10,                         # на сколько пикселей сдвигать картинку
+    dt=5.0,                                     # время, за которое выполняется сдвиг на 1 пиксель (мс)
+    threshold=0.67,                             # порог изменения яркости для генерации события
+    start_index=800                             # используем изображения после обучающей выборки
+):
+    # Создаем тестовую выборку
+    samples = []
+    for idx in range(start_index, start_index + images_per_direction):
+        for d in directions:
+            # Храним пары (направление, индекс картинки)
+            samples.append((d, idx))
+
+    # Перемешиваем выборку
+    random.shuffle(samples)
+    # Храним историю предсказаний (1 - верное, 0 - нет)
+    prediction_history = []
+
+    # Перебираем все пары
+    for direction_label, idx in samples:
+        # Достаем тензор, метку игнорируем
+        img_tensor, _ = mnist_dataset[idx]
+        # Удаляем лишнюю ось и переводим в 2d матрицу
+        image = img_tensor.squeeze().numpy()
+
+        # Формируем события (те же настройки, что и при обучении)
+        events = mnist_image_to_events(
+            image=image,
+            steps=steps_per_image,
+            direction=direction_label,
+            dt=dt,
+            threshold=threshold,
+            substeps=2,
+            pixel_ref=3.0
+        )
+
+        # Сбрасываем состояние сети (кроме весов) перед новым изображением
+        snn.reset()
+
+        for t, x, y, p in events:
+            # train=False: отключаем изменение весов
+            snn.events_to_lif(t, x, y, p, train=False)
+
+        # Подсчитываем количество спайков каждого нейрона
+        spike_counts = [0] * snn.count_neurons
+        for _, neuron_id in snn.spikes:
+            spike_counts[neuron_id] += 1
+
+        # Создаем словарь "голосов" за каждое направление
+        direction_votes = {d: 0 for d in directions}
+        for neuron_id, count in enumerate(spike_counts):
+            # Из ранее собранной статистики узнаем, какое направление предпочитает нейрон
+            pref = neuron_preference.get(neuron_id)
+            # Если направление не None
+            if pref is not None:
+                # Прибавляем к этому направлению количество спайков этого нейрона
+                direction_votes[pref] += count
+
+        # Находим направление с максимальным количеством голосов
+        predicted_direction = max(direction_votes, key=direction_votes.get)
+        # Если предсказание верное
+        if predicted_direction == direction_label:
+            prediction_history.append(1)    # записываем в историю 1
+        else:
+            prediction_history.append(0)    # иначе 0
+
+    # Считаем точность 
+    accuracy = sum(prediction_history) / len(prediction_history)
+    print(f"Точность на тесте: {accuracy:.2%}")
+
+    # Визуализация истории предсказаний
+    v.plot_learning(prediction_history, window=10)
+
+    return prediction_history, accuracy
